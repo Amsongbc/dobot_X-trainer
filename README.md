@@ -8,7 +8,7 @@
 | `run_inference_local_with_intervention.py` | 本地 checkpoint | `Imitate_Model` | ✓ | 本地推理 + 主手按键接管 |
 | `run_ws_inference.py` | 远程服务器 | Motus，JSON + base64 | ✗ | WebSocket 远程推理 |
 | `run_ws_inference_openpi.py` | 远程服务器 | OpenPI (PI-0.5)，msgpack | ✗ | 官方 openpi-client 远程推理 |
-| `run_ws_inference_with_intervention.py` | 远程服务器 | OpenPI (PI-0.5)，msgpack | ✓ | 远程推理 + 主手按键接管 |
+| `run_ws_inference_openpi_with_intervention.py` | 远程服务器 | OpenPI (PI-0.5)，msgpack | ✓ | 远程推理 + 主手按键接管 |
 
 **远程推理（`run_ws_*`）公共功能**：动作块（action chunk）截断执行、时序集成
 （temporal ensemble，前后 chunk 重叠段指数加权融合）、三路 RealSense 相机线程采图、
