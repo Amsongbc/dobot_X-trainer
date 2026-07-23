@@ -7,7 +7,7 @@
 
 | 后端 | 服务端启动 | 协议 | 真机客户端（experiments/） |
 | --- | --- | --- | --- |
-| **OpenPI π0.5** | `serve_openpi05_server.py` | msgpack（官方 `openpi-client`） | `run_ws_inference_openpi.py`、`run_ws_inference_with_intervention.py` |
+| **OpenPI π0.5** | `serve_openpi05_server.py` | msgpack（官方 `openpi-client`） | `run_ws_inference_openpi.py`、`run_ws_inference_openpi_with_intervention.py` |
 | **Motus** | `inference.sh` → `server_vlm_mask.py` | JSON + base64 JPEG | `run_ws_inference.py` |
 
 > 两种协议互不兼容，客户端脚本必须与对应后端配套使用。
