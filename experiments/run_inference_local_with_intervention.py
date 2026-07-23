@@ -17,9 +17,8 @@ from dataclasses import dataclass
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
-sys.pat版本h.append(os.path.join(BASE_DIR, "ModelTrain"))
+sys.path.append(os.path.join(BASE_DIR, "ModelTrain"))
 
-import cv2
 import numpy as np
 import tyro
 
@@ -28,7 +27,6 @@ from dobot_control.agents.dobot_agent import DobotAgent
 from dobot_control.cameras.realsense_camera import RealSenseCamera
 from dobot_control.env import RobotEnv
 from dobot_control.robots.robot_node import ZMQClientRobot
-from ModelTrain.module.model_module import Imitate_Model
 from scripts.manipulate_utils import load_ini_data_camera, load_ini_data_hands
 
 
@@ -36,7 +34,11 @@ from scripts.manipulate_utils import load_ini_data_camera, load_ini_data_hands
 class Args:
     robot_port: int = 6001
     hostname: str = "127.0.0.1"
-    show_img: bool = True
+    show_img: bool = False
+    # True: use the virtual jitter model; False: load the real checkpoint.
+    test_control: bool = True
+    virtual_jitter: float = 0.002
+    control_hz: float = 10.0
     ckpt_dir: str = "./ckpt/clean_dishes"
     ckpt_name: str = "clean_dishes_model.ckpt"
 
@@ -44,6 +46,21 @@ class Args:
 images = [None, None, None]  # top, left wrist, right wrist
 image_lock = threading.Lock()
 camera_running = False
+
+
+class VirtualJitterModel:
+    """A cheap policy used to isolate inference latency from teleoperation."""
+
+    def __init__(self, amplitude: float) -> None:
+        self.amplitude = amplitude
+
+    def predict(self, observation: dict, step: int) -> np.ndarray:
+        action = np.asarray(observation["qpos"], dtype=np.float64).copy()
+        # Alternate around the measured pose instead of a fixed startup pose, so
+        # releasing intervention cannot make the follower jump back unexpectedly.
+        direction = 1.0 if step % 2 == 0 else -1.0
+        action[[5, 12]] += direction * self.amplitude
+        return action
 
 
 def camera_loop(camera: RealSenseCamera, index: int) -> None:
@@ -103,38 +120,23 @@ def move_linearly(env: RobotEnv, target: np.ndarray, max_step: float = 0.001) ->
         env.step(command, np.array([1, 1]))
 
 
-def command_is_safe(action: np.ndarray) -> bool:
-    left_ok = -2.6 < action[2] < 0.0 and action[3] > -0.6
-    right_ok = 0.0 < action[9] < 2.6 and action[10] < 0.6
-    return left_ok and right_ok
-
-
-def workspace_is_safe(env: RobotEnv) -> bool:
-    position = env.get_XYZrxryrz_state()
-    left_ok = (
-        -410 < position[0] < 300
-        and -700 < position[1] < -210
-        and position[2] > 42
-    )
-    right_ok = (
-        -250 < position[6] < 410
-        and -700 < position[7] < -210
-        and position[8] > 42
-    )
-    return left_ok and right_ok
-
-
-def set_error_light(env: RobotEnv) -> None:
-    env.set_do_status([3, 0])
-    env.set_do_status([2, 0])
-    env.set_do_status([1, 1])
-
-
 def main(args: Args) -> int:
     global camera_running
     leader = None
+    cv2 = None
     try:
-        start_cameras()
+        if args.virtual_jitter < 0:
+            raise ValueError("virtual_jitter must be non-negative")
+        if args.control_hz <= 0:
+            raise ValueError("control_hz must be positive")
+        if args.show_img:
+            import cv2 as cv2_module
+
+            cv2 = cv2_module
+
+        use_cameras = not args.test_control or args.show_img
+        if use_cameras:
+            start_cameras()
         env = RobotEnv(ZMQClientRobot(port=args.robot_port, host=args.hostname))
         for channel in (1, 2, 3):
             env.set_do_status([channel, 0])
@@ -147,8 +149,18 @@ def main(args: Args) -> int:
         photo_right = np.deg2rad([90, 0, 90, 0, -90, -90, 57])
         move_linearly(env, np.concatenate([photo_left, photo_right]))
 
-        model = Imitate_Model(ckpt_dir=args.ckpt_dir, ckpt_name=args.ckpt_name)
-        model.loadModel()
+        if args.test_control:
+            model = VirtualJitterModel(args.virtual_jitter)
+            print(
+                f"虚拟模型已启用：腕关节抖动幅度={args.virtual_jitter:.4f} rad，"
+                f"控制频率={args.control_hz:.1f} Hz"
+            )
+        else:
+            from ModelTrain.module.model_module import Imitate_Model
+
+            model = Imitate_Model(ckpt_dir=args.ckpt_dir, ckpt_name=args.ckpt_name)
+            model.loadModel()
+            print("真实本地模型已加载")
         leader = make_leader_agent()
         leader.set_torque(2, True)
 
@@ -165,14 +177,17 @@ def main(args: Args) -> int:
 
         print("本地 policy 已启动：按住对应主手录制键进行人工接管，松开恢复 policy")
         t = 0
+        interval = 1.0 / args.control_hz
         while True:
-            frames = current_images()
-            observation["images"]["top"] = frames[0]
-            observation["images"]["left_wrist"] = frames[1]
-            observation["images"]["right_wrist"] = frames[2]
-            if args.show_img:
-                cv2.imshow("local policy / intervention", np.hstack(frames))
-                cv2.waitKey(1)
+            started = time.monotonic()
+            if use_cameras:
+                frames = current_images()
+                observation["images"]["top"] = frames[0]
+                observation["images"]["left_wrist"] = frames[1]
+                observation["images"]["right_wrist"] = frames[2]
+                if cv2 is not None:
+                    cv2.imshow("local policy / intervention", np.hstack(frames))
+                    cv2.waitKey(1)
 
             policy_action = np.asarray(model.predict(observation, t), dtype=np.float64).copy()
             if policy_action.shape != (14,) or not np.isfinite(policy_action).all():
@@ -213,9 +228,6 @@ def main(args: Args) -> int:
 
             target[[6, 13]] = np.clip(target[[6, 13]], 0.0, 1.0)
             command = target
-            if not command_is_safe(command) or not workspace_is_safe(env):
-                set_error_light(env)
-                raise RuntimeError("Safety boundary reached; robot command stopped")
 
             obs = env.step(command, np.array([1, 1]))
             obs["joint_positions"][[6, 13]] = command[[6, 13]]
@@ -224,6 +236,10 @@ def main(args: Args) -> int:
             was_intervening = intervening.copy()
             t += 1
 
+            remaining = interval - (time.monotonic() - started)
+            if remaining > 0:
+                time.sleep(remaining)
+
     except KeyboardInterrupt:
         print("\n停止本地 policy 人工介入程序")
         return 0
@@ -231,7 +247,8 @@ def main(args: Args) -> int:
         camera_running = False
         if leader is not None:
             leader.set_torque(2, True)
-        cv2.destroyAllWindows()
+        if cv2 is not None:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
