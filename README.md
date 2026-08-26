@@ -23,7 +23,7 @@
 
 ---
 
-## 在线 RL 训练入口 (experiments/run_stage2_env_client.py)
+## 在线 RLT 训练入口 (experiments/run_stage2_env_client.py)
 
 真机侧客户端，把机械臂封装成远程 environment 交给训练端驱动。单文件，不依赖
 `experiments/` 下其他模块。
