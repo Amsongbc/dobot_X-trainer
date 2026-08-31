@@ -81,7 +81,8 @@ GRIPPER_INDICES = (6, 13)
 RLT_PROTOCOL = "rlt-online-rl/v1"
 
 
-# --- Dobot hardware helpers (byte-identical to run_stage2_env_client.py) ---
+# --- Dobot hardware helpers (shared with run_stage2_env_client.py) ---
+# Frames are published as RGB, matching what the model was trained on.
 
 image_left = None
 image_right = None
@@ -95,25 +96,32 @@ def run_thread_cam(
     which_cam: int,
     crop_top_camera: bool = False,
 ) -> None:
+    """Publish frames as RGB.
+
+    ``RealSenseCamera.read`` already returns RGB: it opens the stream as
+    ``rs.format.bgr8`` and reverses the channels itself.  The data-collection
+    script reverses them a second time only to feed ``cv2.imwrite``, which wants
+    BGR; the LeRobot training videos therefore hold RGB.  Inference clients that
+    copied that second reversal without the matching imwrite were sending BGR to
+    an RGB-trained model, so it is deliberately absent here.
+    """
     global image_left, image_right, image_top
     while thread_run:
         if which_cam == 1:
             image, _ = rs_cam.read()
-            image = image[:, :, ::-1]
             with image_lock:
                 image_left = image
         elif which_cam == 2:
             image, _ = rs_cam.read()
-            image = image[:, :, ::-1]
             with image_lock:
                 image_right = image
         elif which_cam == 0:
             image_src, _ = rs_cam.read()
             if crop_top_camera:
-                image_src = image_src[150:420, 220:480, ::-1]
+                image_src = image_src[150:420, 220:480]
                 image = cv2.resize(image_src, (640, 480))
             else:
-                image = image_src[:, :, ::-1]
+                image = image_src
             with image_lock:
                 image_top = image
         else:

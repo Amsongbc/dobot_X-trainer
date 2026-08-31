@@ -83,8 +83,17 @@ class OpenPIWebSocketClient:
             raise ValueError(f"Expected state shape (14,), got {state.shape}")
 
         # LeRobotAlohaDataConfig expects CHW RGB images. MessagePack transports
-        # these arrays directly; JPEG and base64 encoding are not used.
-        chw_images = [np.ascontiguousarray(image.transpose(2, 0, 1), dtype=np.uint8) for image in images]
+        # these arrays directly; JPEG and base64 encoding are not used, so the
+        # array's channel order is exactly what the model sees.
+        #
+        # The capture thread keeps frames in BGR so cv2.imshow / VideoWriter
+        # render correctly, so swap to RGB here, for the payload only.  The
+        # LeRobot training videos hold RGB (verified by decoding them), and the
+        # collection script's BGR flip exists solely to feed cv2.imwrite.
+        chw_images = [
+            np.ascontiguousarray(image[:, :, ::-1].transpose(2, 0, 1), dtype=np.uint8)
+            for image in images
+        ]
         observation = {
             "state": state,
             "images": {

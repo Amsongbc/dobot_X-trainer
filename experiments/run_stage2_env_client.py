@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import os
 import select
+import shutil
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -42,8 +45,9 @@ from scripts.manipulate_utils import load_ini_data_camera, load_ini_data_hands
 
 
 # --- Dobot hardware helpers (inlined; previously experiments/hw_utils.py) ---
-# Camera preprocessing is byte-identical to the original so the observation
-# distribution stays consistent with the base VLA training data.
+# Frames are published as RGB, matching what the model was trained on.  This
+# differs from the older clients, which passed the collection script's
+# cv2.imwrite-oriented BGR flip straight through to the server.
 
 image_left = None
 image_right = None
@@ -57,25 +61,32 @@ def run_thread_cam(
     which_cam: int,
     crop_top_camera: bool = False,
 ) -> None:
+    """Publish frames as RGB.
+
+    ``RealSenseCamera.read`` already returns RGB: it opens the stream as
+    ``rs.format.bgr8`` and reverses the channels itself.  The data-collection
+    script reverses them a second time only to feed ``cv2.imwrite``, which wants
+    BGR; the LeRobot training videos therefore hold RGB.  Inference clients that
+    copied that second reversal without the matching imwrite were sending BGR to
+    an RGB-trained model, so it is deliberately absent here.
+    """
     global image_left, image_right, image_top
     while thread_run:
         if which_cam == 1:
             image, _ = rs_cam.read()
-            image = image[:, :, ::-1]
             with image_lock:
                 image_left = image
         elif which_cam == 2:
             image, _ = rs_cam.read()
-            image = image[:, :, ::-1]
             with image_lock:
                 image_right = image
         elif which_cam == 0:
             image_src, _ = rs_cam.read()
             if crop_top_camera:
-                image_src = image_src[150:420, 220:480, ::-1]
+                image_src = image_src[150:420, 220:480]
                 image = cv2.resize(image_src, (640, 480))
             else:
-                image = image_src[:, :, ::-1]
+                image = image_src
             with image_lock:
                 image_top = image
         else:
@@ -159,6 +170,146 @@ def send_message(connection: socket.socket, message: dict[str, Any]) -> None:
     connection.sendall(_HEADER.pack(len(payload)) + payload)
 
 
+# --- SSH tunnel (so the client needs no second terminal) ---
+
+
+class SSHTunnel:
+    """Own an ``ssh -N -L`` child process for the lifetime of the client.
+
+    The system ssh binary is driven on purpose rather than a pure-Python SSH
+    library: ssh_config aliases, ProxyJump, agent keys and known_hosts all keep
+    working unchanged.  ``-f`` is deliberately NOT passed -- a forked ssh
+    detaches from this process and could no longer be shut down or restarted.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        local_port: int,
+        remote_port: int,
+        jump: Optional[str] = None,
+        remote_host: str = "127.0.0.1",
+        connect_timeout: float = 30.0,
+    ) -> None:
+        self.host = host
+        self.local_port = local_port
+        self.remote_port = remote_port
+        self.jump = jump
+        self.remote_host = remote_host
+        self.connect_timeout = connect_timeout
+        self._process: Optional[subprocess.Popen] = None
+        self._log = None
+        self._adopted = False
+
+    @property
+    def command(self) -> list[str]:
+        command = [
+            "ssh",
+            "-N",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+            # Key auth only: an interactive prompt would hang a headless run.
+            "-o", "BatchMode=yes",
+            "-L",
+            f"127.0.0.1:{self.local_port}:{self.remote_host}:{self.remote_port}",
+        ]
+        if self.jump:
+            command += ["-J", self.jump]
+        command.append(self.host)
+        return command
+
+    def _port_taken(self) -> bool:
+        """Probe by binding, not by connecting.
+
+        Connecting would open a real RPC connection through the tunnel that the
+        Stage 2 server would see and immediately lose.
+        """
+        probe = socket.socket()
+        try:
+            probe.bind(("127.0.0.1", self.local_port))
+        except OSError:
+            return True
+        finally:
+            probe.close()
+        return False
+
+    def _read_log(self) -> str:
+        if self._log is None:
+            return ""
+        try:
+            self._log.seek(0)
+            return self._log.read().strip() or "(ssh 没有输出)"
+        except (OSError, ValueError):
+            return ""
+
+    def _close_log(self) -> None:
+        if self._log is not None:
+            try:
+                self._log.close()
+            except OSError:
+                pass
+            self._log = None
+
+    def ensure(self) -> None:
+        """Start the tunnel, or rebuild it if the ssh child has died."""
+        if self._adopted:
+            return
+        if self._process is not None and self._process.poll() is None:
+            return
+        if self._process is not None:
+            print(f"SSH 隧道已断开（ssh 退出码 {self._process.returncode}），正在重建 ...")
+        elif self._port_taken():
+            # A tunnel from another terminal already forwards this port; reuse
+            # it instead of fighting over the bind.
+            print(f"检测到 127.0.0.1:{self.local_port} 已被占用，复用现有转发")
+            self._adopted = True
+            return
+        self._start()
+
+    def _start(self) -> None:
+        if shutil.which("ssh") is None:
+            raise RuntimeError("找不到 ssh 可执行文件")
+        self._close_log()
+        self._log = tempfile.TemporaryFile(mode="w+")
+        print("启动 SSH 隧道：" + " ".join(self.command))
+        self._process = subprocess.Popen(
+            self.command,
+            stdin=subprocess.DEVNULL,
+            stdout=self._log,
+            stderr=subprocess.STDOUT,
+        )
+        deadline = time.monotonic() + self.connect_timeout
+        while time.monotonic() < deadline:
+            if self._process.poll() is not None:
+                message = self._read_log()
+                self._close_log()
+                raise RuntimeError(f"SSH 隧道启动失败：{message}")
+            if self._port_taken():
+                print(
+                    f"SSH 隧道就绪：127.0.0.1:{self.local_port} -> "
+                    f"{self.host} 的 {self.remote_host}:{self.remote_port}"
+                )
+                return
+            time.sleep(0.3)
+        message = self._read_log()
+        self.close()
+        raise RuntimeError(
+            f"SSH 隧道 {self.connect_timeout:.0f}s 内未就绪：{message}"
+        )
+
+    def close(self) -> None:
+        process, self._process = self._process, None
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            print("SSH 隧道已关闭")
+        self._close_log()
+
+
 class KeyboardReward:
     def __init__(self) -> None:
         self._old_settings = None
@@ -206,6 +357,13 @@ class KeyboardReward:
 class Args:
     server_host: str = "127.0.0.1"
     server_port: int = 18000
+    # Set --ssh-host to let this process own the ssh -N -L tunnel itself.
+    # Left unset, nothing changes: connect to server_host:server_port as before.
+    ssh_host: Optional[str] = None
+    ssh_jump: Optional[str] = None
+    # Port the Stage 2 server listens on, on the far side of the tunnel.
+    remote_port: int = 8000
+    ssh_timeout: float = 30.0
     robot_port: int = 6001
     hostname: str = "127.0.0.1"
     instruction: str = "pour water"
@@ -846,11 +1004,26 @@ class DobotStage2InterventionClient:
 def main(args: Args) -> int:
     if args.control_hz <= 0:
         raise ValueError("control_hz must be positive")
+    tunnel: Optional[SSHTunnel] = None
+    if args.ssh_host:
+        if args.server_host not in ("127.0.0.1", "localhost"):
+            raise ValueError("--ssh-host 时 --server-host 必须是 127.0.0.1")
+        tunnel = SSHTunnel(
+            host=args.ssh_host,
+            local_port=args.server_port,
+            remote_port=args.remote_port,
+            jump=args.ssh_jump,
+            connect_timeout=args.ssh_timeout,
+        )
+        # Fail before the cameras and the robot are brought up.
+        tunnel.ensure()
     client: Optional[DobotStage2InterventionClient] = None
     try:
         client = DobotStage2InterventionClient(args)
         while True:
             try:
+                if tunnel is not None:
+                    tunnel.ensure()
                 print(f"连接 Stage 2 环境服务器 {args.server_host}:{args.server_port} ...")
                 with socket.create_connection(
                     (args.server_host, args.server_port), timeout=30
@@ -879,6 +1052,8 @@ def main(args: Args) -> int:
             client.close()
         stop_cameras()
         cv2.destroyAllWindows()
+        if tunnel is not None:
+            tunnel.close()
 
 
 if __name__ == "__main__":
