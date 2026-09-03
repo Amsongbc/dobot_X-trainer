@@ -260,12 +260,30 @@ class SSHTunnel:
         if self._process is not None:
             print(f"SSH 隧道已断开（ssh 退出码 {self._process.returncode}），正在重建 ...")
         elif self._port_taken():
-            # A tunnel from another terminal already forwards this port; reuse
-            # it instead of fighting over the bind.
-            print(f"检测到 127.0.0.1:{self.local_port} 已被占用，复用现有转发")
-            self._adopted = True
-            return
+            # A just-terminated ssh process can keep the port unavailable for
+            # a short time.  Do not permanently mistake that transient state
+            # for a reusable tunnel.
+            deadline = time.monotonic() + 1.0
+            while self._port_taken() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if self._port_taken():
+                print(
+                    f"检测到 127.0.0.1:{self.local_port} 持续被占用，"
+                    "复用现有转发"
+                )
+                self._adopted = True
+                return
+            print(
+                f"127.0.0.1:{self.local_port} 的短暂占用已释放，"
+                "将建立新 SSH 隧道"
+            )
         self._start()
+
+    def invalidate_adopted(self) -> None:
+        """Retry ownership when a supposedly reusable forward cannot connect."""
+        if self._adopted:
+            print("现有 SSH 转发不可用，下次重连将重新检测或建立隧道")
+            self._adopted = False
 
     def _start(self) -> None:
         if shutil.which("ssh") is None:
@@ -406,6 +424,9 @@ def make_leader_agent() -> BimanualAgent:
 
 
 class DobotStage2InterventionClient:
+    # Keep the legacy Dobot controller's definition of an A-button short press.
+    BUTTON_A_SHORT_PRESS_SECONDS = 0.5
+
     def __init__(self, args: Args) -> None:
         self.args = args
         self.feedback = KeyboardReward()
@@ -1042,6 +1063,8 @@ def main(args: Args) -> int:
             except KeyboardInterrupt:
                 raise
             except (ConnectionError, OSError) as exc:
+                if tunnel is not None:
+                    tunnel.invalidate_adopted()
                 print(f"连接中断：{exc}；{args.reconnect_delay:.1f}s 后重连")
                 time.sleep(args.reconnect_delay)
     except KeyboardInterrupt:
