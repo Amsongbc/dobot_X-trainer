@@ -34,6 +34,14 @@ This file is self-contained: the keyboard monitor, the intervention chunk
 buffer, the rewind history, the RealSense capture threads and the Dobot
 environment client are all inlined, so it drives the robot without importing
 any other experiments module.
+
+SSH forwarding (same options as run_stage2_env_client.py; no second terminal):
+    python efficient_rl_stage2_client.py \
+        --ssh-host sysu_xdliang_2@pytorch-ng-30000 \
+        --ssh-jump 13c09e665f284d65a28a7545f79197c7@proxy.nscc-gz.cn:8022
+Local 127.0.0.1:18000 forwards to the server's 127.0.0.1:8000. Both ports
+can be overridden with --server-port / --remote-port. Without --ssh-host,
+connect directly to --server-host:--server-port as before.
 """
 from __future__ import annotations
 
@@ -57,6 +65,7 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 import tyro
+from websockets.exceptions import ConnectionClosed, InvalidHandshake
 from openpi_client import websocket_client_policy as _websocket_client_policy
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -71,6 +80,7 @@ from scripts.manipulate_utils import load_ini_data_camera, load_ini_data_hands
 
 ACTION_DIM = 14
 GRIPPER_INDICES = (6, 13)
+NETWORK_ERRORS = (ConnectionError, OSError, ConnectionClosed, InvalidHandshake)
 
 
 # --- Dobot hardware helpers (inlined; previously experiments/hw_utils.py) ---
@@ -223,10 +233,12 @@ class SSHTunnel:
         """Probe by binding, not by connecting.
 
         Connecting would open a real websocket connection through the tunnel
-        that the Stage 2 server would see and immediately lose.
+        that the Stage 2 server would see and immediately lose. SO_REUSEADDR
+        ignores TIME_WAIT sockets, while an active listener still blocks bind.
         """
         probe = socket.socket()
         try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", self.local_port))
         except OSError:
             return True
@@ -448,6 +460,7 @@ class InterventionChunk:
     observation: dict[str, Any]
     actions: np.ndarray
     next_observation: dict[str, Any]
+    step_observations: tuple[dict[str, Any], ...] = ()
 
 
 class InterventionChunkBuffer:
@@ -469,6 +482,7 @@ class InterventionChunkBuffer:
         self.chunk_length = int(chunk_length)
         self._observation: Optional[dict[str, Any]] = None
         self._actions: list[np.ndarray] = []
+        self._step_observations: list[dict[str, Any]] = []
         self._completed: deque[InterventionChunk] = deque()
 
     @property
@@ -486,6 +500,7 @@ class InterventionChunkBuffer:
     def clear(self) -> None:
         self._observation = None
         self._actions.clear()
+        self._step_observations.clear()
         self._completed.clear()
 
     def start(self, observation: dict[str, Any]) -> None:
@@ -493,11 +508,13 @@ class InterventionChunkBuffer:
             raise RuntimeError("cannot replace the start observation of an active chunk")
         self._observation = observation
 
-    def append_action(self, action: np.ndarray) -> None:
+    def append_action(self, action: np.ndarray, observation: Optional[dict[str, Any]] = None) -> None:
         if self._observation is None:
             raise RuntimeError("chunk requires a start observation before its first action")
         if len(self._actions) >= self.chunk_length:
             raise RuntimeError("chunk is full and must be closed at a boundary before appending")
+        if observation is not None:
+            self._step_observations.append({"offset": len(self._actions), "observation": observation})
         self._actions.append(np.asarray(action, dtype=np.float32).copy())
 
     def close_at_boundary(self, next_observation: dict[str, Any]) -> InterventionChunk:
@@ -511,12 +528,14 @@ class InterventionChunkBuffer:
             observation=self._observation,
             actions=np.stack(self._actions, axis=0).astype(np.float32, copy=False),
             next_observation=next_observation,
+            step_observations=tuple(self._step_observations),
         )
         self._completed.append(chunk)
         # The state at one boundary is shared by the adjacent transitions:
         # next_observation_t == observation_{t+1}.
         self._observation = next_observation
         self._actions.clear()
+        self._step_observations.clear()
         return chunk
 
     def pop_completed(self) -> Optional[InterventionChunk]:
@@ -722,6 +741,10 @@ class DobotStage2RLTClient:
             raise RuntimeError(
                 f"server action_dim={server_action_dim} does not match the Dobot's {ACTION_DIM}"
             )
+        if 0 < int(args.max_actions_to_publish) < self.chunk_length:
+            raise ValueError("This RLT server requires complete chunks; set max_actions_to_publish=0")
+        self.step_obs_offsets = set(int(v) for v in metadata.get("step_obs_offsets", []))
+        self.takeover_step_obs = bool(metadata.get("step_window_include_intervention", False))
         self.replay_action_space = str(metadata.get("replay_action_space", "robot"))
         print(
             f"Server metadata: chunk_length={self.chunk_length} "
@@ -794,6 +817,7 @@ class DobotStage2RLTClient:
         self._server_stopped = False
 
         self._stop_event = threading.Event()
+        self._connection_error: Optional[Exception] = None
         self._button_thread = threading.Thread(
             target=self._button_loop, name="dobot-button-a-monitor", daemon=True
         )
@@ -1288,10 +1312,13 @@ class DobotStage2RLTClient:
                     with self._chunk_buffer_lock:
                         self._chunk_buffer.close_at_boundary(boundary_obs)
                     self._chunk_ready.set()
+                with self._chunk_buffer_lock:
+                    offset = len(self._chunk_buffer._actions)
+                step_obs = self.observation() if self.takeover_step_obs and offset in self.step_obs_offsets else None
                 target, _ = self._leader_target(base)
                 action = self._apply_action(target)
                 with self._chunk_buffer_lock:
-                    self._chunk_buffer.append_action(action)
+                    self._chunk_buffer.append_action(action, step_obs)
                     if self._chunk_buffer.completed_count:
                         self._chunk_ready.set()
             except KeyboardInterrupt:
@@ -1345,6 +1372,7 @@ class DobotStage2RLTClient:
                     bootstrap_mask=bootstrap_mask,
                     info=info,
                     intervention=True,
+                    step_observations=list(chunk.step_observations),
                     action_chunk=chunk.actions,
                     action_chunk_space="robot",
                     steps_executed=self.chunk_length,
@@ -1358,6 +1386,13 @@ class DobotStage2RLTClient:
                     self._takeover_stop.set()
                     return
             except Exception as exc:
+                if isinstance(exc, NETWORK_ERRORS):
+                    # Hand reconnect back to the main thread; stop accumulating
+                    # human chunks against a dead websocket.
+                    self._connection_error = exc
+                    self._takeover_stop.set()
+                    self._takeover_active = False
+                    return
                 # Keep teleop alive: the operator still has the arm, and the
                 # next chunk may well go through.
                 print(f"[Takeover] act/transition 失败（本 chunk 丢弃）：{exc}")
@@ -1455,6 +1490,7 @@ class DobotStage2RLTClient:
         action_chunk: np.ndarray,
         action_chunk_space: str,
         steps_executed: int,
+        step_observations: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         with self._policy_lock:
             response = self.policy.infer(
@@ -1469,6 +1505,7 @@ class DobotStage2RLTClient:
                     "intervention": bool(intervention),
                     "action_chunk": action_chunk,
                     "action_chunk_space": action_chunk_space,
+                    "step_observations": step_observations or [],
                 }
             )
         self._episode_chunks += 1
@@ -1551,10 +1588,15 @@ class DobotStage2RLTClient:
         if self.last_action is not None:
             self.rewind_history.seed(self.last_action)
         executed = 0
+        self._executed_actions = []
+        self._executed_step_observations = []
         for index, proposed in enumerate(actions):
             self.keyboard.poll()
             self._drain_edges(chunk_in_flight=True)
+            if index in self.step_obs_offsets:
+                self._executed_step_observations.append({"offset": index, "observation": self.observation()})
             action = self._apply_action(proposed)
+            self._executed_actions.append(np.asarray(action, dtype=np.float32).copy())
             self.rewind_history.record(action)
             executed += 1
             if self.args.action_publish_interval > 0 and index < len(actions) - 1:
@@ -1700,6 +1742,8 @@ class DobotStage2RLTClient:
     def run_episode(self) -> None:
         observation = self.reset_episode()
         while not self._stop_event.is_set() and not self._server_stopped:
+            if self._connection_error is not None:
+                raise self._connection_error
             self.keyboard.poll()
             self._drain_edges(chunk_in_flight=False)
 
@@ -1753,7 +1797,7 @@ class DobotStage2RLTClient:
                 self.robot_faulted = True
                 self.rewind_history.drop_building()
                 fault_reason = f"{type(exc).__name__}: {exc}"
-                steps_executed = 0
+                steps_executed = len(getattr(self, "_executed_actions", []))
                 print(f"机械臂故障，本回合以 fault 终止：{fault_reason}")
 
             next_observation = self.safe_observation()
@@ -1771,6 +1815,12 @@ class DobotStage2RLTClient:
                 fault_reason=fault_reason,
             )
             info["intervention"] = False
+            info["steps_executed"] = steps_executed
+            executed_rows = getattr(self, "_executed_actions", [])
+            replay_actions = np.asarray(actions_to_publish, dtype=np.float32).copy()
+            if executed_rows:
+                replay_actions[:len(executed_rows)] = np.stack(executed_rows)
+                replay_actions[len(executed_rows):] = executed_rows[-1]
             self._transition(
                 transition_id=str(result["transition_id"]),
                 next_observation=next_observation,
@@ -1780,7 +1830,8 @@ class DobotStage2RLTClient:
                 info=info,
                 intervention=False,
                 action_chunk=replay_actions,
-                action_chunk_space=replay_space,
+                action_chunk_space="robot",
+                step_observations=getattr(self, "_executed_step_observations", []),
                 steps_executed=max(steps_executed, 1),
             )
             observation = next_observation
@@ -1839,11 +1890,13 @@ def main(args: Args) -> int:
             jump=args.ssh_jump,
             connect_timeout=args.ssh_timeout,
         )
-        # Fail before the cameras and the robot are brought up.
-        tunnel.ensure()
-
     client: Optional[DobotStage2RLTClient] = None
+    policy = None
     try:
+        # Same lifecycle as run_stage2_env_client: no hardware startup before
+        # SSH is ready, and Ctrl-C during SSH startup still closes the child.
+        if tunnel is not None:
+            tunnel.ensure()
         while True:
             try:
                 if tunnel is not None:
@@ -1852,21 +1905,31 @@ def main(args: Args) -> int:
                 policy = _websocket_client_policy.WebsocketClientPolicy(
                     host=args.server_host, port=args.server_port
                 )
+                # WebsocketClientPolicy.reset() is a no-op. Send the RLT reset
+                # explicitly so a crashed client's unfinished episode cannot
+                # be joined to the new one. Weights and stored replay survive.
+                reply = policy.infer({"rlt/request": "reset"})
+                if not reply.get("ok", False):
+                    raise RuntimeError(f"Server rejected session reset: {reply}")
                 if client is None:
                     client = DobotStage2RLTClient(args, policy)
                 else:
                     # Hardware is already up; only the websocket was lost.
                     client.policy = policy
+                    client._connection_error = None
                 print("Stage 2 RLT 服务器已连接（倒车 + 接管已启用）")
                 client.run()
                 return 0
             except KeyboardInterrupt:
                 raise
-            except (ConnectionError, OSError) as exc:
+            except NETWORK_ERRORS as exc:
                 if tunnel is not None:
                     tunnel.invalidate_adopted()
                 if client is not None:
+                    client._stop_takeover_thread()
                     client.keyboard.stop()
+                _close_policy_connection(policy)
+                policy = None
                 print(f"连接中断：{exc}；{args.reconnect_delay:.1f}s 后重连")
                 time.sleep(args.reconnect_delay)
     except KeyboardInterrupt:
@@ -1876,12 +1939,23 @@ def main(args: Args) -> int:
         traceback.print_exc()
         return 1
     finally:
+        _close_policy_connection(policy)
         if client is not None:
             client.close()
         stop_cameras()
         cv2.destroyAllWindows()
         if tunnel is not None:
             tunnel.close()
+
+
+def _close_policy_connection(policy: Any) -> None:
+    # The current OpenPI client exposes no public close() method.
+    connection = getattr(policy, "_ws", None)
+    if connection is not None:
+        try:
+            connection.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
