@@ -24,8 +24,15 @@ Keyboard labels while this process is focused:
     b          : enter/cancel rewind mode after the current chunk finishes
     r          : while in rewind mode, reverse-play one finished action chunk
     q          : mark one previous replay chunk as bad without moving the robot
-    i          : request/cancel takeover after the current chunk finishes
+    i          : optional keyboard takeover shortcut
     Ctrl+C     : stop
+
+After ``b`` pauses policy in rewind mode, either leader recording button starts
+takeover directly from the paused pose. Teleoperation keeps running at
+``control_hz``, while held-button actions are sampled into replay at
+``takeover_record_hz``. Releasing the button holds the current pose and keeps
+takeover active. Press ``b`` again to return to policy. No ``i`` press is
+required for this workflow.
 
 Leaving rewind via b/i can penalize the discarded branch and cut its TD
 bootstrap; see --rewind-physical-exit-reward / --rewind-credit-exit-reward.
@@ -460,6 +467,7 @@ class InterventionChunk:
     observation: dict[str, Any]
     actions: np.ndarray
     next_observation: dict[str, Any]
+    steps_executed: int
     step_observations: tuple[dict[str, Any], ...] = ()
 
 
@@ -497,6 +505,10 @@ class InterventionChunkBuffer:
     def completed_count(self) -> int:
         return len(self._completed)
 
+    @property
+    def action_count(self) -> int:
+        return len(self._actions)
+
     def clear(self) -> None:
         self._observation = None
         self._actions.clear()
@@ -517,26 +529,49 @@ class InterventionChunkBuffer:
             self._step_observations.append({"offset": len(self._actions), "observation": observation})
         self._actions.append(np.asarray(action, dtype=np.float32).copy())
 
-    def close_at_boundary(self, next_observation: dict[str, Any]) -> InterventionChunk:
+    def _finish(
+        self,
+        next_observation: dict[str, Any],
+        *,
+        continue_from_boundary: bool,
+    ) -> InterventionChunk:
         if self._observation is None:
             raise RuntimeError("cannot close a chunk without a start observation")
+        steps_executed = len(self._actions)
+        if not 0 < steps_executed <= self.chunk_length:
+            raise RuntimeError(f"invalid intervention step count: {steps_executed}")
+        actions = [entry.copy() for entry in self._actions]
+        # The RLT wire format has a fixed action horizon. A recording-button
+        # release may end before that horizon, so pad only the wire payload and
+        # preserve the real Hz-derived length in steps_executed.
+        actions.extend(
+            actions[-1].copy() for _ in range(self.chunk_length - steps_executed)
+        )
+        chunk = InterventionChunk(
+            observation=self._observation,
+            actions=np.stack(actions, axis=0).astype(np.float32, copy=False),
+            next_observation=next_observation,
+            steps_executed=steps_executed,
+            step_observations=tuple(self._step_observations),
+        )
+        self._completed.append(chunk)
+        self._observation = next_observation if continue_from_boundary else None
+        self._actions.clear()
+        self._step_observations.clear()
+        return chunk
+
+    def close_at_boundary(self, next_observation: dict[str, Any]) -> InterventionChunk:
         if len(self._actions) != self.chunk_length:
             raise RuntimeError(
                 f"cannot close an incomplete chunk: {len(self._actions)}/{self.chunk_length} actions"
             )
-        chunk = InterventionChunk(
-            observation=self._observation,
-            actions=np.stack(self._actions, axis=0).astype(np.float32, copy=False),
-            next_observation=next_observation,
-            step_observations=tuple(self._step_observations),
-        )
-        self._completed.append(chunk)
-        # The state at one boundary is shared by the adjacent transitions:
+        # The state at one boundary is shared by adjacent full transitions:
         # next_observation_t == observation_{t+1}.
-        self._observation = next_observation
-        self._actions.clear()
-        self._step_observations.clear()
-        return chunk
+        return self._finish(next_observation, continue_from_boundary=True)
+
+    def close_on_release(self, next_observation: dict[str, Any]) -> InterventionChunk:
+        """Finish real recording-button steps and pad only the wire payload."""
+        return self._finish(next_observation, continue_from_boundary=False)
 
     def pop_completed(self) -> Optional[InterventionChunk]:
         if not self._completed:
@@ -709,6 +744,8 @@ class Args:
     takeover_key: str = "i"
     relative_takeover: bool = True
     """Map leader displacement onto the follower's current pose (recommended)."""
+    takeover_record_hz: float = 3.0
+    """Replay sampling rate for human actions; teleoperation still uses control_hz."""
 
     pause_after_episode: bool = True
 
@@ -797,7 +834,10 @@ class DobotStage2RLTClient:
         # --- takeover state ---
         self._takeover_pending = False
         self._takeover_active = False
+        self._control_generation = 0
         self._takeover_stop = threading.Event()
+        self._takeover_input_done = threading.Event()
+        self._takeover_return_requested = threading.Event()
         self._takeover_thread: Optional[threading.Thread] = None
         self._takeover_rl_thread: Optional[threading.Thread] = None
         self._chunk_buffer = InterventionChunkBuffer(self.chunk_length)
@@ -815,19 +855,27 @@ class DobotStage2RLTClient:
         self._episode_done = False
         self._eval_episode_warned = False
         self._server_stopped = False
+        self._episode_ready = threading.Event()
+        self._main_transition_idle = threading.Event()
+        self._main_transition_idle.set()
 
         self._stop_event = threading.Event()
         self._connection_error: Optional[Exception] = None
         self._button_thread = threading.Thread(
-            target=self._button_loop, name="dobot-button-a-monitor", daemon=True
+            target=self._button_loop, name="dobot-leader-button-monitor", daemon=True
         )
         self._button_thread.start()
+        print(
+            "[Takeover V7 sampled-replay] 接管流程：b 停顿 → "
+            "录制键控制/松键保持 → 再次按 b 归还 policy；无需按 i"
+        )
 
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
 
     def close(self) -> None:
+        self._episode_ready.clear()
         self._stop_event.set()
         self._stop_takeover_thread()
         self._button_thread.join(timeout=5.0)
@@ -915,13 +963,28 @@ class DobotStage2RLTClient:
             self._button_a_pressed = pressed
 
     def _button_loop(self) -> None:
-        """Monitor button A for the entire lifetime of the client process."""
+        """Monitor recovery and recording buttons for the client lifetime."""
         interval = 1.0 / max(self.args.control_hz, 20.0)
         while not self._stop_event.is_set():
             try:
                 keys = self.leader.get_keys()
                 intervening = np.asarray(keys[:, 1] == 0, dtype=bool)
                 self._update_button_a(keys, intervening)
+                if (
+                    self.args.takeover_enabled
+                    and intervening.any()
+                    and self._episode_ready.is_set()
+                    and not self._episode_done
+                    and self._rewind_mode_active
+                    and not self._takeover_active
+                ):
+                    print(
+                        "[Takeover] b 停顿期间检测到录制键 → "
+                        "退出倒车模式并自动接管（无需按 i）"
+                    )
+                    self._apply_rewind_exit_correction()
+                    self._deactivate_rewind_mode()
+                    self._activate_takeover()
             except Exception as exc:  # never let the monitor kill the run
                 print(f"主手按键监听异常（已忽略）：{exc}")
             self._stop_event.wait(interval)
@@ -1245,15 +1308,21 @@ class DobotStage2RLTClient:
         self._activate_takeover()
 
     def _activate_takeover(self) -> None:
-        if self._takeover_active:
-            return
-        self._takeover_pending = False
-        self._takeover_active = True
+        # Serialize the ownership handoff with follower commands.  If policy is
+        # in the middle of a servo tick, that tick completes first; no later
+        # policy tick can pass the active check in _execute_chunk.
+        with self._env_lock:
+            if self._takeover_active:
+                return
+            self._takeover_pending = False
+            self._takeover_active = True
+            self._control_generation += 1
         self._takeover_stop.clear()
+        self._takeover_input_done.clear()
+        self._takeover_return_requested.clear()
         self._chunk_ready.clear()
         with self._chunk_buffer_lock:
             self._chunk_buffer.clear()
-            self._chunk_buffer.start(self.safe_observation())
         # A takeover chunk must not be mixed into the policy rewind history.
         self.rewind_history.drop_building()
         # Teleop and the act/transition round trip run on separate threads so a
@@ -1267,66 +1336,147 @@ class DobotStage2RLTClient:
         self._takeover_thread.start()
         self._takeover_rl_thread.start()
         print(
-            "[Takeover] 接管开始：按住主手录制键移动，"
-            f"每 {self.chunk_length} 步打包一条 intervention transition；"
-            f"再按 {self.args.takeover_key} 归还 policy"
+            "[Takeover] 录制键接管：遥操 "
+            f"{self.args.control_hz:g} Hz，数据采样 "
+            f"{self.args.takeover_record_hz:g} Hz；松开后保持当前位姿；"
+            f"按 {self.args.rewind_mode_key} 归还 policy；"
+            f"单条 transition 最多 {self.chunk_length} 个真实 step"
         )
 
-    def _deactivate_takeover(self) -> None:
-        if not self._takeover_active:
+    def _request_takeover_return(self) -> None:
+        """Ask teleop to close its current chunk, then return to policy."""
+        if not self._takeover_active or self._takeover_return_requested.is_set():
             return
+        self._takeover_return_requested.set()
+        print("[Takeover] 已请求归还 policy；正在收尾人工 transition")
+
+    def _deactivate_takeover(self) -> None:
+        was_active = self._takeover_active
         self._takeover_active = False
+        self._takeover_pending = False
         self._stop_takeover_thread()
+        self._takeover_return_requested.clear()
         with self._leader_state_lock:
             self.leader.set_torque(2, True)
             self.was_intervening[:] = False
         with self._chunk_buffer_lock:
             self._chunk_buffer.clear()
-        print("[Takeover] 接管结束 → 回到 policy")
+        if was_active:
+            print("[Takeover] 接管结束 → 回到 policy")
 
     def _stop_takeover_thread(self) -> None:
         self._takeover_stop.set()
+        self._takeover_input_done.set()
         self._chunk_ready.set()
         current = threading.current_thread()
         for attribute in ("_takeover_thread", "_takeover_rl_thread"):
             thread = getattr(self, attribute)
-            setattr(self, attribute, None)
             # Never join the thread we are running on (the RL loop ends the
             # episode itself when the operator presses s/f during takeover).
             if thread is not None and thread.is_alive() and thread is not current:
                 thread.join(timeout=5.0)
+            # Retain a timed-out worker reference so reset_episode can wait for
+            # episode_end to finish instead of letting it mutate a new episode.
+            if thread is None or thread is current or not thread.is_alive():
+                if getattr(self, attribute) is thread:
+                    setattr(self, attribute, None)
 
     def _takeover_loop(self) -> None:
-        """Drive the follower from the leader and package chunk-aligned transitions."""
+        """Drive at control_hz and sample replay actions at takeover_record_hz."""
         interval = 1.0 / self.args.control_hz
+        record_interval = 1.0 / self.args.takeover_record_hz
         deadline = time.monotonic()
+        next_record_at = deadline
+        saw_recording = False
         while not self._takeover_stop.is_set() and not self._stop_event.is_set():
             try:
                 base = self.last_action
                 if base is None:
                     break
-                with self._chunk_buffer_lock:
-                    needs_boundary = self._chunk_buffer.needs_boundary_observation
-                if needs_boundary:
-                    boundary_obs = self.observation()
+                target, intervening = self._leader_target(base)
+                recording = bool(intervening.any())
+
+                if self._takeover_return_requested.is_set():
                     with self._chunk_buffer_lock:
-                        self._chunk_buffer.close_at_boundary(boundary_obs)
-                    self._chunk_ready.set()
-                with self._chunk_buffer_lock:
-                    offset = len(self._chunk_buffer._actions)
-                step_obs = self.observation() if self.takeover_step_obs and offset in self.step_obs_offsets else None
-                target, _ = self._leader_target(base)
-                action = self._apply_action(target)
-                with self._chunk_buffer_lock:
-                    self._chunk_buffer.append_action(action, step_obs)
-                    if self._chunk_buffer.completed_count:
+                        action_count = self._chunk_buffer.action_count
+                    if action_count:
+                        boundary_obs = self.observation()
+                        with self._chunk_buffer_lock:
+                            chunk = self._chunk_buffer.close_on_release(boundary_obs)
                         self._chunk_ready.set()
+                        print(
+                            "[Takeover] b 归还：提交最后人工片段 "
+                            f"steps_executed={chunk.steps_executed}"
+                        )
+                    self._takeover_input_done.set()
+                    self._chunk_ready.set()
+                    return
+
+                if not recording:
+                    if saw_recording:
+                        with self._chunk_buffer_lock:
+                            action_count = self._chunk_buffer.action_count
+                        if action_count:
+                            boundary_obs = self.observation()
+                            with self._chunk_buffer_lock:
+                                chunk = self._chunk_buffer.close_on_release(boundary_obs)
+                            self._chunk_ready.set()
+                            print(
+                                "[Takeover] 录制键松开：提交 "
+                                f"steps_executed={chunk.steps_executed}；"
+                                "保持当前位姿，接管模式继续"
+                            )
+                        saw_recording = False
+                    deadline += interval
+                    self._takeover_stop.wait(max(0.0, deadline - time.monotonic()))
+                    continue
+
+                now = time.monotonic()
+                if not saw_recording:
+                    # Record the first command immediately on every new press.
+                    next_record_at = now
+                saw_recording = True
+                record_this_action = now >= next_record_at
+                step_obs = None
+                if record_this_action:
+                    with self._chunk_buffer_lock:
+                        needs_start = self._chunk_buffer.needs_start_observation
+                        needs_boundary = self._chunk_buffer.needs_boundary_observation
+                    if needs_start:
+                        start_obs = self.observation()
+                        with self._chunk_buffer_lock:
+                            self._chunk_buffer.start(start_obs)
+                    elif needs_boundary:
+                        boundary_obs = self.observation()
+                        with self._chunk_buffer_lock:
+                            self._chunk_buffer.close_at_boundary(boundary_obs)
+                        self._chunk_ready.set()
+                    with self._chunk_buffer_lock:
+                        offset = self._chunk_buffer.action_count
+                    step_obs = (
+                        self.observation()
+                        if self.takeover_step_obs and offset in self.step_obs_offsets
+                        else None
+                    )
+                action = self._apply_action(target)
+                if record_this_action:
+                    with self._chunk_buffer_lock:
+                        self._chunk_buffer.append_action(action, step_obs)
+                        if self._chunk_buffer.completed_count:
+                            self._chunk_ready.set()
+                    next_record_at += record_interval
+                    if next_record_at <= now:
+                        # Do not duplicate one physical command to catch up
+                        # after a delayed control tick.
+                        next_record_at = now + record_interval
             except KeyboardInterrupt:
                 break
             except Exception as exc:
                 print(f"[Takeover] 控制异常，接管终止：{exc}")
                 self.robot_faulted = True
                 self._takeover_active = False
+                self._takeover_input_done.set()
+                self._chunk_ready.set()
                 break
             deadline += interval
             self._takeover_stop.wait(max(0.0, deadline - time.monotonic()))
@@ -1337,7 +1487,8 @@ class DobotStage2RLTClient:
         """Ship each completed takeover chunk as its own act/transition pair.
 
         Runs off the teleop thread on purpose: the human keeps moving the arm at
-        control_hz while this waits on the policy server.
+        control_hz while replay samples arrive at takeover_record_hz and this
+        waits on the policy server.
         """
         while not self._takeover_stop.is_set() and not self._stop_event.is_set():
             self._chunk_ready.wait(timeout=0.2)
@@ -1348,8 +1499,22 @@ class DobotStage2RLTClient:
                 if chunk is None or self._chunk_buffer.completed_count == 0:
                     self._chunk_ready.clear()
             if chunk is None:
+                if self._takeover_input_done.is_set():
+                    self._takeover_active = False
+                    self._takeover_stop.set()
+                    with self._leader_state_lock:
+                        self.leader.set_torque(2, True)
+                        self.was_intervening[:] = False
+                    print("[Takeover] b 收尾完成 → 归还 policy")
+                    return
                 continue
             try:
+                # A policy act/transition pair may already be in flight when the
+                # hardware button starts takeover.  Let the main thread discard
+                # or store it before requesting an intervention transition id.
+                while not self._main_transition_idle.wait(timeout=0.1):
+                    if self._takeover_stop.is_set() or self._stop_event.is_set():
+                        return
                 result = self._act(chunk.observation)
                 if result is None:
                     self._takeover_stop.set()
@@ -1359,11 +1524,16 @@ class DobotStage2RLTClient:
                     reward_signal = None
                 rewards, done, bootstrap_mask, info = self._build_rewards(
                     reward_signal,
-                    steps_executed=self.chunk_length,
+                    steps_executed=chunk.steps_executed,
                     small_progress_presses=small_presses,
                 )
                 info["intervention"] = True
-                info["takeover_continuous"] = True
+                info["takeover_continuous"] = (
+                    chunk.steps_executed == self.chunk_length
+                )
+                info["recording_button_takeover"] = True
+                info["takeover_control_hz"] = float(self.args.control_hz)
+                info["takeover_record_hz"] = float(self.args.takeover_record_hz)
                 self._transition(
                     transition_id=str(result["transition_id"]),
                     next_observation=chunk.next_observation,
@@ -1375,10 +1545,10 @@ class DobotStage2RLTClient:
                     step_observations=list(chunk.step_observations),
                     action_chunk=chunk.actions,
                     action_chunk_space="robot",
-                    steps_executed=self.chunk_length,
+                    steps_executed=chunk.steps_executed,
                 )
                 self._episode_interventions += 1
-                self._episode_intervention_actions += int(self.chunk_length)
+                self._episode_intervention_actions += int(chunk.steps_executed)
                 if done:
                     self._episode_success = bool(info.get("success", False))
                     self._finish_episode()
@@ -1554,6 +1724,7 @@ class DobotStage2RLTClient:
         except Exception as exc:
             print(f"[RLT episode_end] 失败：{exc}")
         finally:
+            self._episode_ready.clear()
             self._episode_idx += 1
             self._episode_reward = 0.0
             self._episode_chunks = 0
@@ -1579,9 +1750,10 @@ class DobotStage2RLTClient:
     def _execute_chunk(self, actions: np.ndarray) -> int:
         """Send one chunk to the follower, recording it for rewind as we go.
 
-        Keys are polled between commands, so ``b``/``i`` pressed mid-chunk are
-        armed here and applied at the boundary -- the same stop-and-go rule the
-        Franka node follows, so the transition is never cut in half.
+        Keyboard mode keys are applied at a transition boundary. Hardware
+        recording buttons activate the independent takeover loop; this method
+        stops before publishing another stale policy command once ownership
+        changes.
         """
         interval = 1.0 / self.args.control_hz
         deadline = time.monotonic()
@@ -1590,15 +1762,26 @@ class DobotStage2RLTClient:
         executed = 0
         self._executed_actions = []
         self._executed_step_observations = []
+        self._executed_intervention_masks = []
         for index, proposed in enumerate(actions):
             self.keyboard.poll()
             self._drain_edges(chunk_in_flight=True)
-            if index in self.step_obs_offsets:
-                self._executed_step_observations.append({"offset": index, "observation": self.observation()})
-            action = self._apply_action(proposed)
-            self._executed_actions.append(np.asarray(action, dtype=np.float32).copy())
-            self.rewind_history.record(action)
-            executed += 1
+            with self._env_lock:
+                if self._takeover_active:
+                    break
+                if index in self.step_obs_offsets:
+                    self._executed_step_observations.append(
+                        {"offset": index, "observation": self.observation()}
+                    )
+                action = self._apply_action(proposed)
+                self._executed_actions.append(
+                    np.asarray(action, dtype=np.float32).copy()
+                )
+                self._executed_intervention_masks.append(
+                    np.zeros(2, dtype=bool)
+                )
+                self.rewind_history.record(action)
+                executed += 1
             if self.args.action_publish_interval > 0 and index < len(actions) - 1:
                 time.sleep(self.args.action_publish_interval)
             deadline += interval
@@ -1617,7 +1800,10 @@ class DobotStage2RLTClient:
             if edge is None:
                 return
             if edge == "rewind_mode":
-                self._handle_rewind_mode_toggle(chunk_in_flight=chunk_in_flight)
+                if self._takeover_active:
+                    self._request_takeover_return()
+                else:
+                    self._handle_rewind_mode_toggle(chunk_in_flight=chunk_in_flight)
             elif edge == "rewind_step":
                 if chunk_in_flight:
                     print(
@@ -1657,17 +1843,50 @@ class DobotStage2RLTClient:
                 f"{self.args.rewind_credit_key}=只标坏不动",
             ]
         if self.args.takeover_enabled:
-            keys.append(f"{self.args.takeover_key}=接管/归还")
+            keys.append("b 后录制键=接管/松开=保持/再按 b=归还")
+            keys.append(f"{self.args.takeover_key}=可选键盘接管快捷键")
         keys.append("Ctrl+C=停止")
         print(f"回合 {self._episode_idx} 开始：" + "，".join(keys))
 
     def reset_episode(self) -> dict[str, Any]:
+        self._episode_ready.clear()
+        self._main_transition_idle.set()
         self.keyboard.stop()
-        self.keyboard.clear()
+        # Do this unconditionally.  A terminal s/f handled by the takeover RL
+        # thread sets _takeover_active=False before it exits, so an
+        # active-only cleanup would leave the previous episode's thread/events
+        # alive and let them leak into the next episode.
         self._deactivate_takeover()
+        lingering_workers = [
+            thread.name
+            for thread in (self._takeover_thread, self._takeover_rl_thread)
+            if thread is not None and thread.is_alive()
+        ]
+        if lingering_workers:
+            print(
+                "[Episode reset] 等待上一回合完成 episode_end："
+                + ", ".join(lingering_workers)
+            )
+            for attribute in ("_takeover_thread", "_takeover_rl_thread"):
+                thread = getattr(self, attribute)
+                if thread is not None and thread.is_alive():
+                    thread.join()
+                if getattr(self, attribute) is thread:
+                    setattr(self, attribute, None)
         self._deactivate_rewind_mode()
+        self._rewind_chunks_taken = 0
+        self._rewind_credit_chunks_marked = 0
+        self._rewind_selection_mode = None
         self.rewind_history.clear()
+        # Clear keyboard state only after old episode workers have stopped, so
+        # no old worker can consume or re-expose an s/b event after this point.
+        self.keyboard.clear()
+        self._takeover_stop.clear()
+        self._takeover_input_done.clear()
+        self._takeover_return_requested.clear()
+        self._chunk_ready.clear()
         self._episode_done = False
+        print("[Episode reset] 上一回合的按键、接管、倒车状态已全部清除")
         with self._leader_state_lock:
             self.leader.set_torque(2, True)
             self.was_intervening[:] = False
@@ -1699,10 +1918,11 @@ class DobotStage2RLTClient:
             self.last_action[index] = 1.0
         observation = self.observation()
         self.keyboard.start()
+        self._episode_ready.set()
         self._print_episode_banner()
         print(
-            "人工接管：按 "
-            f"{self.args.takeover_key} 进入接管后，按住任一主手录制键移动；"
+            "人工接管：先按 b 进入停顿，再按住任一主手录制键移动；"
+            "松开录制键只保持当前位置，再按 b 才归还 policy，无需按 i；"
             "短按主手 A 键可解锁/锁定对应主臂以恢复初始位置"
         )
         return observation
@@ -1758,13 +1978,26 @@ class DobotStage2RLTClient:
                 observation = self.safe_observation()
                 continue
 
+            # Close the race between the active check above and an automatic
+            # hardware-button takeover starting from the monitor thread.
+            with self._env_lock:
+                if self._takeover_active:
+                    continue
+                act_generation = self._control_generation
+                self._main_transition_idle.clear()
             result = self._act(observation)
             if result is None:
+                self._main_transition_idle.set()
                 break
             # A takeover armed while act() was in flight must not execute a chunk
             # inferred from a state the human has since changed.
-            if self._takeover_active:
+            if (
+                self._takeover_active
+                or self._control_generation != act_generation
+            ):
                 self._discard(str(result["transition_id"]), "takeover_during_infer")
+                self._main_transition_idle.set()
+                observation = self.safe_observation()
                 continue
 
             actions_raw = np.asarray(result["actions"], dtype=np.float32)
@@ -1800,7 +2033,22 @@ class DobotStage2RLTClient:
                 steps_executed = len(getattr(self, "_executed_actions", []))
                 print(f"机械臂故障，本回合以 fault 终止：{fault_reason}")
 
-            next_observation = self.safe_observation()
+            # Snapshot the policy boundary atomically with the ownership
+            # generation. A takeover beginning after this snapshot belongs to
+            # the next transition and may safely run during the network RPC.
+            with self._env_lock:
+                takeover_invalidated_policy = (
+                    self._control_generation != act_generation
+                )
+                next_observation = self.safe_observation()
+            if takeover_invalidated_policy:
+                self._discard(
+                    str(result["transition_id"]),
+                    "takeover_during_policy_execution",
+                )
+                self._main_transition_idle.set()
+                observation = next_observation
+                continue
             small_presses = 0
             if fault_reason is not None:
                 reward_signal = "fault"
@@ -1814,7 +2062,16 @@ class DobotStage2RLTClient:
                 small_progress_presses=small_presses,
                 fault_reason=fault_reason,
             )
-            info["intervention"] = False
+            intervention_mask = np.zeros((self.chunk_length, 2), dtype=bool)
+            executed_masks = getattr(self, "_executed_intervention_masks", [])
+            if executed_masks:
+                intervention_mask[:len(executed_masks)] = np.stack(executed_masks)
+            intervention_occurred = bool(
+                intervention_mask[:steps_executed].any()
+            )
+            info["intervention"] = intervention_occurred
+            info["intervention_occurred"] = intervention_occurred
+            info["intervention_mask"] = intervention_mask
             info["steps_executed"] = steps_executed
             executed_rows = getattr(self, "_executed_actions", [])
             replay_actions = np.asarray(actions_to_publish, dtype=np.float32).copy()
@@ -1828,12 +2085,18 @@ class DobotStage2RLTClient:
                 done=done,
                 bootstrap_mask=bootstrap_mask,
                 info=info,
-                intervention=False,
+                intervention=intervention_occurred,
                 action_chunk=replay_actions,
                 action_chunk_space="robot",
                 step_observations=getattr(self, "_executed_step_observations", []),
                 steps_executed=max(steps_executed, 1),
             )
+            self._main_transition_idle.set()
+            if intervention_occurred:
+                self._episode_interventions += 1
+                self._episode_intervention_actions += int(
+                    intervention_mask[:steps_executed].any(axis=1).sum()
+                )
             observation = next_observation
 
             if done:
@@ -1867,6 +2130,10 @@ class DobotStage2RLTClient:
 def main(args: Args) -> int:
     if args.control_hz <= 0:
         raise ValueError("control_hz must be positive")
+    if args.takeover_record_hz <= 0:
+        raise ValueError("takeover_record_hz must be positive")
+    if args.takeover_record_hz > args.control_hz:
+        raise ValueError("takeover_record_hz must not exceed control_hz")
     if args.rewind_enabled:
         edge_keys = {
             args.rewind_mode_key.lower()[:1],
