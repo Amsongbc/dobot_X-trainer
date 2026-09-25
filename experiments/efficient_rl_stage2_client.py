@@ -25,6 +25,8 @@ Keyboard labels while this process is focused:
     r          : while in rewind mode, reverse-play one finished action chunk
     q          : mark one previous replay chunk as bad without moving the robot
     i          : optional keyboard takeover shortcut
+    a          : switch VLA <-> actor from the next chunk; only actor chunks
+                 (and takeovers while the actor is on) are written to replay
     Ctrl+C     : stop
 
 After ``b`` pauses policy in rewind mode, either leader recording button starts
@@ -375,6 +377,7 @@ class KeyboardMonitor:
         rewind_step_key: str = "r",
         rewind_credit_key: str = "q",
         takeover_key: str = "i",
+        actor_switch_key: str = "",
     ) -> None:
         self._old_settings = None
         self._raw = False
@@ -389,6 +392,7 @@ class KeyboardMonitor:
             (rewind_step_key, "rewind_step"),
             (rewind_credit_key, "rewind_credit"),
             (takeover_key, "takeover"),
+            (actor_switch_key, "actor_switch"),
         ):
             key = (key or "").strip().lower()[:1]
             if key:
@@ -747,6 +751,13 @@ class Args:
     takeover_record_hz: float = 3.0
     """Replay sampling rate for human actions; teleoperation still uses control_hz."""
 
+    # --- actor switch (切换 actor / VLA) ---
+    actor_switch_key: str = "a"
+    """Toggle VLA <-> actor, effective from the next chunk. VLA chunks, and
+    takeovers made while on VLA, run on the robot but are not stored."""
+    start_with_actor: bool = False
+    """Mode every episode starts in; False = VLA until the key is pressed."""
+
     pause_after_episode: bool = True
 
 
@@ -783,6 +794,12 @@ class DobotStage2RLTClient:
         self.step_obs_offsets = set(int(v) for v in metadata.get("step_obs_offsets", []))
         self.takeover_step_obs = bool(metadata.get("step_window_include_intervention", False))
         self.replay_action_space = str(metadata.get("replay_action_space", "robot"))
+        self.policy_switch_supported = bool(metadata.get("supports_policy_switch", False))
+        if not self.policy_switch_supported:
+            print(
+                "[Actor switch] 服务端不支持 policy 字段，切换键已禁用，全程 actor 且全部写入 replay；"
+                "请更新服务端 online_rl_policy.py"
+            )
         print(
             f"Server metadata: chunk_length={self.chunk_length} "
             f"action_dim={server_action_dim} replay_space={self.replay_action_space} "
@@ -794,6 +811,7 @@ class DobotStage2RLTClient:
             rewind_step_key=args.rewind_step_key if args.rewind_enabled else "",
             rewind_credit_key=args.rewind_credit_key if args.rewind_enabled else "",
             takeover_key=args.takeover_key if args.takeover_enabled else "",
+            actor_switch_key=args.actor_switch_key if self.policy_switch_supported else "",
         )
 
         # --- hardware ---
@@ -830,6 +848,12 @@ class DobotStage2RLTClient:
         self._rewind_credit_chunks_marked = 0
         self._rewind_selection_mode: Optional[str] = None
         self._rewind_to_takeover_pending = False
+
+        # --- actor switch state ---
+        self._actor_active = bool(args.start_with_actor) or not self.policy_switch_supported
+        # Policy the chunks in rewind_history were run with; rewinding never
+        # crosses a switch, because VLA chunks are not in replay.
+        self._history_policy: Optional[str] = None
 
         # --- takeover state ---
         self._takeover_pending = False
@@ -1210,6 +1234,9 @@ class DobotStage2RLTClient:
                 "不能与只标坏混用"
             )
             return
+        if self._history_policy == "vla":
+            print("[Rewind credit] 当前是 VLA 段，这些 chunk 不在 replay 中，无需标坏")
+            return
         if self._rewind_credit_chunks_marked >= int(self._episode_chunks):
             print("[Rewind credit] 本回合没有更早的已存 chunk 可标记")
             return
@@ -1229,6 +1256,10 @@ class DobotStage2RLTClient:
         self._rewind_credit_chunks_marked = 0
         self._rewind_selection_mode = None
 
+        if self._history_policy == "vla":
+            if chunks or credit_chunks:
+                print("[Rewind] 倒回的是 VLA 段（未写入 replay），不做 replay 修正")
+            return
         if selection_mode == "credit" and credit_chunks > 0:
             reward = float(self.args.rewind_credit_exit_reward)
             request = {
@@ -1574,6 +1605,8 @@ class DobotStage2RLTClient:
 
     def _act(self, observation: dict[str, Any]) -> Optional[dict[str, Any]]:
         request: dict[str, Any] = {"rlt/request": "act", "observation": observation}
+        if self.policy_switch_supported:
+            request["policy"] = self._current_policy()
         if self.args.exploration_noise_sigma >= 0.0:
             request["exploration_noise_sigma"] = float(self.args.exploration_noise_sigma)
         with self._policy_lock:
@@ -1822,6 +1855,23 @@ class DobotStage2RLTClient:
                     self._handle_rewind_credit_step()
             elif edge == "takeover":
                 self._handle_takeover_toggle(chunk_in_flight=chunk_in_flight)
+            elif edge == "actor_switch":
+                self._toggle_actor(chunk_in_flight=chunk_in_flight)
+
+    def _current_policy(self) -> str:
+        return "actor" if self._actor_active else "vla"
+
+    def _toggle_actor(self, *, chunk_in_flight: bool) -> None:
+        """``a``: switch VLA <-> actor; the next act request uses the new policy."""
+        if self._episode_done:
+            print("[Actor switch] 回合已结束；先按 n 开始下一回合")
+            return
+        self._actor_active = not self._actor_active
+        when = "当前 chunk 执行完后" if chunk_in_flight else "下一个 chunk"
+        if self._actor_active:
+            print(f"[Actor switch] → actor（{when}生效）：actor chunk 与期间的接管写入 replay")
+        else:
+            print(f"[Actor switch] → VLA（{when}生效）：VLA chunk 与期间的接管只执行，不写 replay")
 
     # ------------------------------------------------------------------
     # episode driving
@@ -1845,8 +1895,15 @@ class DobotStage2RLTClient:
         if self.args.takeover_enabled:
             keys.append("b 后录制键=接管/松开=保持/再按 b=归还")
             keys.append(f"{self.args.takeover_key}=可选键盘接管快捷键")
+        if self.policy_switch_supported:
+            keys.append(f"{self.args.actor_switch_key}=切换 actor/VLA")
         keys.append("Ctrl+C=停止")
         print(f"回合 {self._episode_idx} 开始：" + "，".join(keys))
+        if self.policy_switch_supported:
+            print(
+                f"[Actor switch] 本回合从 {self._current_policy()} 开始；"
+                "只有 actor 段（含期间接管）写入 replay"
+            )
 
     def reset_episode(self) -> dict[str, Any]:
         self._episode_ready.clear()
@@ -1878,6 +1935,8 @@ class DobotStage2RLTClient:
         self._rewind_credit_chunks_marked = 0
         self._rewind_selection_mode = None
         self.rewind_history.clear()
+        self._history_policy = None
+        self._actor_active = bool(self.args.start_with_actor) or not self.policy_switch_supported
         # Clear keyboard state only after old episode workers have stopped, so
         # no old worker can consume or re-expose an s/b event after this point.
         self.keyboard.clear()
@@ -1980,6 +2039,13 @@ class DobotStage2RLTClient:
 
             # Close the race between the active check above and an automatic
             # hardware-button takeover starting from the monitor thread.
+            policy = self._current_policy()
+            if policy != self._history_policy:
+                if self._history_policy is not None and self.rewind_history.available():
+                    print("[Actor switch] 倒车缓存已清空：倒车不跨越 actor/VLA 切换点")
+                self.rewind_history.clear()
+                self._history_policy = policy
+
             with self._env_lock:
                 if self._takeover_active:
                     continue
@@ -2140,11 +2206,12 @@ def main(args: Args) -> int:
             args.rewind_step_key.lower()[:1],
             args.rewind_credit_key.lower()[:1],
             args.takeover_key.lower()[:1],
+            args.actor_switch_key.lower()[:1],
         }
-        if len(edge_keys) != 4:
-            raise ValueError("rewind/takeover keys must be distinct")
+        if len(edge_keys) != 5:
+            raise ValueError("rewind/takeover/actor-switch keys must be distinct")
         if edge_keys & set(KeyboardMonitor.REWARD_KEYS):
-            raise ValueError("rewind/takeover keys must not collide with reward keys")
+            raise ValueError("rewind/takeover/actor-switch keys must not collide with reward keys")
 
     tunnel: Optional[SSHTunnel] = None
     if args.ssh_host:
